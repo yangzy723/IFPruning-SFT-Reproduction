@@ -1,28 +1,39 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+IFPruning SFT Inference Pipeline
+--------------------------------
+Evaluates the dynamically pruned model by computing contextual masks via the 
+predictor network prior to standard autoregressive generation.
+"""
+
 import os
 import sys
 import logging
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from transformers.models.gemma.modeling_gemma import GemmaMLP
 from safetensors.torch import load_file
 
 # ==============================================================================
-# 全局日志配置
+# Global Logging Configuration
 # ==============================================================================
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] -> %(message)s",
+    format="%(asctime)s [%(levelname)s] [%(process)d] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S", 
     level=logging.INFO,
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ifpruning_inference")
 
 # ==============================================================================
-# 模块 1: 核心组件 (绝对数值稳定版)
+# Module 1: Architectural Components
 # ==============================================================================
 class SparsityPredictor(nn.Module):
+    """Routing network to compute layer-wise FFN channel importance scores."""
     def __init__(self, target_num_layers: int, target_ffn_dim: int, extractor_path: str):
         super().__init__()
         self.num_layers = target_num_layers
@@ -38,6 +49,7 @@ class SparsityPredictor(nn.Module):
         extractor_hidden_dim = getattr(config, "hidden_size", None) or \
                                getattr(config, "d_model", None) or \
                                getattr(config, "n_embd", None)    
+        
         if extractor_hidden_dim is None:
             extractor_hidden_dim = self.feature_extractor.get_input_embeddings().weight.shape[1]
 
@@ -55,6 +67,7 @@ class SparsityPredictor(nn.Module):
 
 
 class GemmaDynamicMaskedFFN_Inference(nn.Module):
+    """Modified FFN applying deterministic hard Top-K masking for inference."""
     def __init__(self, original_mlp: GemmaMLP, target_ffn_dim: int):
         super().__init__()
         self.gate_proj = original_mlp.gate_proj
@@ -69,23 +82,23 @@ class GemmaDynamicMaskedFFN_Inference(nn.Module):
         up_out = self.up_proj(x)
         
         if self.layer_scores is not None:
+            # Ensure spatial alignment across potential multi-GPU device maps
             scores = self.layer_scores.to(device=x.device, dtype=x.dtype)
             
-            # 🛡️ 核心修复：抛弃带有核爆风险的 Softmax 放大系数，直接提取 Hard Top-K
-            # 这保证了被选中的神经元权重为绝对的 1.0，屏蔽的为 0.0，绝不改变原模型的激活值规模！
+            # Deterministic hard selection: bypass SoftTopK thresholding
             _, topk_idx = torch.topk(scores, self.target_ffn_dim, dim=-1)
             indicator = torch.zeros_like(scores).scatter_(-1, topk_idx, 1.0)
             
             mask = indicator.unsqueeze(1) 
             activated_hidden = (gate_out * up_out) * mask
         else:
-            logger.error("推理期间未检测到锁定的层掩码！模型退化为 Dense 模式。")
+            logger.warning("Layer scores not detected. Falling back to dense execution.")
             activated_hidden = gate_out * up_out
             
         return self.down_proj(activated_hidden)
 
 # ==============================================================================
-# 模块 2: 推理架构代理与掩码锁定机制
+# Module 2: Checkpoint Resolution and Injection Pipeline
 # ==============================================================================
 class GemmaIFPruningWrapper(nn.Module):
     def __init__(self, base_model, target_ffn_dim: int, extractor_path: str):
@@ -94,9 +107,13 @@ class GemmaIFPruningWrapper(nn.Module):
         cfg = getattr(base_model.config, "text_config", base_model.config)
         
         self.predictor = SparsityPredictor(cfg.num_hidden_layers, cfg.intermediate_size, extractor_path)
-        self.predictor.to(device=base_model.device, dtype=base_model.dtype)
+        
+        # Anchor the predictor to the first device used by the base model
+        target_device = next(base_model.parameters()).device
+        self.predictor.to(device=target_device, dtype=base_model.dtype)
         
         self.llm_layers = [m for n, m in self.base_model.named_modules() if isinstance(m, nn.ModuleList) and hasattr(m[0], 'mlp')][0]
+        
         for layer in self.llm_layers:
             layer.mlp = GemmaDynamicMaskedFFN_Inference(layer.mlp, target_ffn_dim)
 
@@ -107,66 +124,78 @@ class GemmaIFPruningWrapper(nn.Module):
             return getattr(self.base_model, name)
 
     def compute_and_lock_mask(self, predictor_input_ids: torch.Tensor, predictor_attention_mask: torch.Tensor):
+        """Computes pruning scores once based on the prompt context and locks them into the layers."""
         with torch.no_grad():
-            all_layer_scores = self.predictor(predictor_input_ids, predictor_attention_mask)
+            target_device = next(self.predictor.parameters()).device
+            p_ids = predictor_input_ids.to(target_device)
+            p_mask = predictor_attention_mask.to(target_device)
+            
+            all_layer_scores = self.predictor(p_ids, p_mask)
             for i, layer in enumerate(self.llm_layers):
                 layer.mlp.layer_scores = all_layer_scores[:, i, :]
-        logger.info(f"✅ 掩码已成功计算并锁定！(Target Dim: 4096，模式: Hard Mask 防爆)")
+                
+        logger.info(f"Contextual mask computed and locked successfully. (Target Dim: {self.llm_layers[0].mlp.target_ffn_dim})")
 
 # ==============================================================================
-# 主推理管线
+# Execution Entry Point
 # ==============================================================================
 def main():
-    base_model_path = os.path.abspath("./gemma-4-12b")
-    predictor_model_path = os.path.abspath("./Qwen3.5-0.8b")
-    checkpoint_path = os.path.abspath("./gemma-12b-ifpruning-output/checkpoint-7000/model.safetensors") 
+    # Update to target the verified checkpoint directory
+    checkpoint_dir = Path("./gemma-12b-ifpruning-output/checkpoint-3500")
+    predictor_model_path = Path("./Qwen3.5-0.8b")
+    predictor_weights_path = checkpoint_dir / "predictor_mlp.safetensors"
+    
     target_dim = 4096
 
-    logger.info("1. 加载 Tokenizer...")
-    base_tokenizer = AutoTokenizer.from_pretrained(base_model_path, local_files_only=True)
-    predictor_tokenizer = AutoTokenizer.from_pretrained(predictor_model_path, local_files_only=True)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory missing: {checkpoint_dir}")
+    if not predictor_weights_path.exists():
+        raise FileNotFoundError(f"Predictor weights missing: {predictor_weights_path}")
 
-    logger.info("2. 加载 Gemma-12B 底座并启动多卡切分 (device_map)...")
+    logger.info("Initializing tokenizers...")
+    # Always load base tokenizer from the original model path to guarantee files exist
+    base_model_path = Path("./gemma-4-12b")
+    base_tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), local_files_only=True)
+    # Always load predictor tokenizer from its original path
+    predictor_tokenizer = AutoTokenizer.from_pretrained(str(predictor_model_path), local_files_only=True)
+
+    logger.info("Loading base SFT model and executing device placement mapping...")
+    # By passing the checkpoint_dir, HF loads the fine-tuned base model efficiently
     base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_path, 
+        str(checkpoint_dir), 
         torch_dtype=torch.bfloat16, 
-        device_map="auto"
+        device_map="auto",
+        local_files_only=True
     )
 
-    logger.info("3. 包装 IFPruning 动态推理架构...")
-    model = GemmaIFPruningWrapper(base_model, target_dim, predictor_model_path)
+    logger.info("Injecting dynamic activation sparsity architecture...")
+    model = GemmaIFPruningWrapper(base_model, target_dim, str(predictor_model_path))
 
-    # ==========================================================================
-    # 🌟 核心修复：既然内存够大，直接使用原生 API，确保所有 Tied Weights 完美加载
-    # ==========================================================================
-    logger.info(f"4. 正在从硬盘加载 46GB 权重进内存，请稍候...")
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"找不到权重文件: {checkpoint_path}")
-        
-    state_dict = load_file(checkpoint_path)
-    logger.info(f"5. 正在将权重分发至 GPU (确保指针无损)...")
-    model.load_state_dict(state_dict, strict=False)
+    logger.info("Restoring decoupled predictor parameters from safetensors...")
+    pred_state_dict = load_file(str(predictor_weights_path))
+    model.predictor.mlp.load_state_dict(pred_state_dict, strict=True)
+    del pred_state_dict
     
-    # 释放内存中的庞大字典
-    del state_dict 
-    torch.cuda.empty_cache()
-    # ==========================================================================
-
     model.eval()
-    logger.info("🚀 模型环境就绪，启动推理！\n")
+    logger.info("Inference pipeline operational.")
     
-    instruction = "用 Python 写一个快速排序算法，并加好注释。"
+    instruction = "Write a quicksort algorithm in Python and include detailed comments."
     prompt = f"<start_of_turn>user\n{instruction}<end_of_turn>\n<start_of_turn>model\n"
     
-    base_inputs = base_tokenizer(prompt, return_tensors="pt").to(base_model.device)
-    pred_inputs = predictor_tokenizer(prompt, return_tensors="pt").to(base_model.device)
+    base_inputs = base_tokenizer(prompt, return_tensors="pt")
+    pred_inputs = predictor_tokenizer(prompt, return_tensors="pt")
     
+    # Pre-compute and lock the structural sparsity mask
     model.compute_and_lock_mask(
         predictor_input_ids=pred_inputs["input_ids"],
         predictor_attention_mask=pred_inputs["attention_mask"]
     )
 
-    logger.info("开始流式生成...")
+    logger.info("Initiating autoregressive generation...")
+    # Use dynamic parameter probing to avoid structural naming conflicts
+    input_device = next(base_model.parameters()).device
+    base_inputs = {k: v.to(input_device) for k, v in base_inputs.items()}
+    
     with torch.no_grad():
         outputs = model.base_model.generate(
             **base_inputs, 
@@ -180,11 +209,11 @@ def main():
     input_length = base_inputs["input_ids"].shape[1]
     response = base_tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True)
     
-    print("\n" + "=" * 60)
-    print(f"😎 用户输入: {instruction}")
-    print("=" * 60)
-    print(f"🤖 稀疏模型响应:\n{response}")
-    print("=" * 60 + "\n")
+    print("\n" + "=" * 80)
+    print(f"User Prompt:\n{instruction}")
+    print("-" * 80)
+    print(f"Sparse Model Response:\n{response}")
+    print("=" * 80 + "\n")
 
 if __name__ == "__main__":
     main()

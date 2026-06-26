@@ -1,4 +1,4 @@
-# IFPruning: Distributed Supervised Fine-Tuning with Dynamic Activation Sparsity
+# IFPruning-SFT: Unofficial Reproduction of AFM-3 Instruction-Following Pruning
 
 ## 1. Overview
 
