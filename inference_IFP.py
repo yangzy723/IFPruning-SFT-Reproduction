@@ -140,33 +140,37 @@ class GemmaIFPruningWrapper(nn.Module):
 # Execution Entry Point
 # ==============================================================================
 def main():
-    # Update to target the verified checkpoint directory
-    checkpoint_dir = Path("./gemma-12b-ifpruning-output/checkpoint-3500")
+    checkpoint_dir = Path("./gemma-12b-ifpruning-output/checkpoint-3236")
     predictor_model_path = Path("./Qwen3.5-0.8b")
     predictor_weights_path = checkpoint_dir / "predictor_mlp.safetensors"
     
     target_dim = 4096
 
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory missing: {checkpoint_dir}")
-    if not predictor_weights_path.exists():
-        raise FileNotFoundError(f"Predictor weights missing: {predictor_weights_path}")
+    if not checkpoint_dir.exists() or not predictor_weights_path.exists():
+        raise FileNotFoundError("Missing checkpoint or predictor weights.")
 
     logger.info("Initializing tokenizers...")
-    # Always load base tokenizer from the original model path to guarantee files exist
     base_model_path = Path("./gemma-4-12b")
     base_tokenizer = AutoTokenizer.from_pretrained(str(base_model_path), local_files_only=True)
-    # Always load predictor tokenizer from its original path
     predictor_tokenizer = AutoTokenizer.from_pretrained(str(predictor_model_path), local_files_only=True)
 
-    logger.info("Loading base SFT model and executing device placement mapping...")
-    # By passing the checkpoint_dir, HF loads the fine-tuned base model efficiently
+    logger.info("Loading custom base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         str(checkpoint_dir), 
         torch_dtype=torch.bfloat16, 
         device_map="auto",
         local_files_only=True
     )
+
+    try:
+        embed_weight = base_model.model.language_model.embed_tokens.weight
+        lm_head_weight = base_model.lm_head.weight
+        if embed_weight.data_ptr() != lm_head_weight.data_ptr():
+            logger.warning("检测到 LM Head 与 Embeddings 未物理绑定，正在强制同步内存...")
+            base_model.lm_head.weight = embed_weight
+            logger.info("权重绑定完成！")
+    except Exception as e:
+        logger.error(f"强制权重绑定失败，请检查架构路径: {e}")
 
     logger.info("Injecting dynamic activation sparsity architecture...")
     model = GemmaIFPruningWrapper(base_model, target_dim, str(predictor_model_path))
@@ -179,20 +183,34 @@ def main():
     model.eval()
     logger.info("Inference pipeline operational.")
     
-    instruction = "Write a quicksort algorithm in Python and include detailed comments."
-    prompt = f"<start_of_turn>user\n{instruction}<end_of_turn>\n<start_of_turn>model\n"
+    instruction = "Tell me something about China and Jiangxi Province"
     
-    base_inputs = base_tokenizer(prompt, return_tensors="pt")
-    pred_inputs = predictor_tokenizer(prompt, return_tensors="pt")
+    # 1. Base Model 必须使用标准的 Chat Template 拼接对话结构
+    chat_tpl = (
+        "{% for m in messages %}"
+        "{{'<|turn>' + m['role'] + '\\n' + m['content'] + '<turn|>\\n'}}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{'<|turn>model\\n'}}{% endif %}"
+    )
+    messages = [{"role": "user", "content": instruction}]
+    base_prompt = base_tokenizer.apply_chat_template(
+        messages, 
+        tokenize=False, 
+        add_generation_prompt=True,
+        chat_template=chat_tpl
+    )
+    base_inputs = base_tokenizer(base_prompt, return_tensors="pt", add_special_tokens=False)
     
-    # Pre-compute and lock the structural sparsity mask
+    # 2. Predictor 必须且只能输入原始的 instruction 纯文本 (与 train.py 完全对齐)
+    pred_inputs = predictor_tokenizer(instruction, return_tensors="pt", add_special_tokens=True)
+    
+    # 计算掩码
     model.compute_and_lock_mask(
         predictor_input_ids=pred_inputs["input_ids"],
         predictor_attention_mask=pred_inputs["attention_mask"]
     )
 
     logger.info("Initiating autoregressive generation...")
-    # Use dynamic parameter probing to avoid structural naming conflicts
     input_device = next(base_model.parameters()).device
     base_inputs = {k: v.to(input_device) for k, v in base_inputs.items()}
     

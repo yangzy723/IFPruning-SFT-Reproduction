@@ -14,6 +14,7 @@ Qwen3.5-0.8b/
 
 # 3. 数据集与 HuggingFace 缓存
 alpaca-cleaned/
+OpenHermes-2.5/
 hf_cache/
 
 # 4. 训练输出目录 (Checkpoint、Logs、DeepSpeed States)

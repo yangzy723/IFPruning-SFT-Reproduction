@@ -9,6 +9,7 @@ Objective: Implement the Supervised Fine-Tuning (SFT) phase of IFPruning.
 3) The masked Large Language Model (LLM) is trained on response tokens using standard next-token prediction loss.
 4) The LLM and the predictor's MLP head are optimized concurrently, while the predictor's backbone remains frozen.
 5) Ensure absolute state safety and complete checkpoint recovery in distributed DeepSpeed environments.
+6) Blends Alpaca and OpenHermes datasets directly from local disk.
 """
 
 import os
@@ -28,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_dataset, concatenate_datasets
 from safetensors.torch import save_file, load_file
 from deepspeed.ops.adam import FusedAdam
 from transformers import (
@@ -73,7 +74,6 @@ def setup_logging(output_dir: str, log_level: str = "INFO") -> Tuple[logging.Log
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
-        
         print(f"Critical error: Failed to create log directory at {log_dir}. Exception: {e}", file=sys.stderr)
         raise
 
@@ -131,10 +131,12 @@ class RunConfig:
     base_model: str = "./gemma-4-12b"
     predictor_model: str = "./Qwen3.5-0.8b"
     output_dir: str = "./gemma-12b-ifpruning-output"
-    dataset_name: str = "yahma/alpaca-cleaned"
-    dataset_config: Optional[str] = None
-    dataset_split: str = "train"
+    
+    dataset_alpaca: str = "./alpaca-cleaned/alpaca_data_cleaned.json"
+    dataset_hermes: str = "./OpenHermes-2.5/openhermes2_5.json"
+    hermes_sample_size: int = 100000
     cache_dir: str = "./hf_cache"
+    
     local_files_only: bool = True
 
     target_intermediate_dim: int = 4096
@@ -144,7 +146,7 @@ class RunConfig:
 
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    num_train_epochs: float = 10.0
+    num_train_epochs: float = 1
     max_steps: int = -1
     base_lr: float = 2e-6
     predictor_lr: float = 1e-5
@@ -506,8 +508,10 @@ def patch_model_for_ifpruning(base_model: nn.Module, cfg: RunConfig) -> Tuple[nn
 def extract_prompt_response(examples: Dict, i: int) -> Tuple[str, str]:
     """Safely extracts prompt and response strings from varying dataset structures."""
     try:
-        if "messages" in examples:
-            raw_msg = examples["messages"][i]
+        # Compatibility for ShareGPT/OpenHermes ("conversations") & standard ("messages")
+        if "messages" in examples or "conversations" in examples:
+            msg_key = "messages" if "messages" in examples else "conversations"
+            raw_msg = examples[msg_key][i]
             msgs = json.loads(raw_msg) if isinstance(raw_msg, str) else raw_msg
             
             u = next((m.get("content", m.get("value", "")) for m in msgs 
@@ -516,6 +520,7 @@ def extract_prompt_response(examples: Dict, i: int) -> Tuple[str, str]:
                       if m.get("role", m.get("from", "")) in {"assistant", "gpt", "model"}), "")
             return u.strip(), a.strip()
         
+        # Compatibility for Alpaca standard structure
         if "instruction" in examples and "output" in examples:
             inst = examples["instruction"][i].strip()
             inp = examples.get("input", [""] * len(examples["instruction"]))[i].strip()
@@ -676,6 +681,7 @@ class IFPruningTrainer(Trainer):
             "base_nd": []
         }
 
+        # Defense mechanism: Ensure stable ZeRO partition alignment
         for name, param in sorted(self.model.named_parameters(), key=lambda x: x[0]):
             if not param.requires_grad: 
                 continue
@@ -773,7 +779,7 @@ def main():
         "logging_steps": cfg.logging_steps,
         "save_steps": cfg.save_steps,
         "save_total_limit": cfg.save_total_limit,
-        "save_safetensors": True,
+        "safe_serialization": True, # FIXED: Replaced save_safetensors with safe_serialization
         "report_to": [] if cfg.report_to == "none" else cfg.report_to.split(","),
         "dataloader_num_workers": cfg.dataloader_num_workers,
         "gradient_checkpointing": cfg.gradient_checkpointing,
@@ -784,7 +790,7 @@ def main():
     valid_args = inspect.signature(TrainingArguments.__init__).parameters
     t_args = TrainingArguments(**{k: v for k, v in ta_kwargs.items() if k in valid_args})
 
-    LOGGER.info("Initializing Tokenizers and loading Dataset...")
+    LOGGER.info("Initializing Tokenizers...")
     try:
         b_tok = AutoTokenizer.from_pretrained(
             cfg.base_model,
@@ -796,13 +802,32 @@ def main():
             local_files_only=cfg.local_files_only,
             use_fast=True
         )
-        raw_dataset = load_dataset(
-            cfg.dataset_name,
-            cfg.dataset_config,
-            split=cfg.dataset_split,
+        
+        LOGGER.info("Parsing RAW JSON datasets from local disk...")
+        alpaca_raw = load_dataset(
+            "json", 
+            data_files=cfg.dataset_alpaca, 
+            split="train", 
             cache_dir=cfg.cache_dir
         )
-        tokenized_dataset = tokenize_sft_dataset(raw_dataset, b_tok, p_tok, cfg, t_args)
+        hermes_raw = load_dataset(
+            "json", 
+            data_files=cfg.dataset_hermes, 
+            split="train", 
+            cache_dir=cfg.cache_dir
+        )
+        
+        safe_sample_size = min(cfg.hermes_sample_size, len(hermes_raw))
+        hermes_raw = hermes_raw.shuffle(seed=cfg.seed).select(range(safe_sample_size))
+        
+        LOGGER.info("Tokenizing and Caching Data Streams...")
+        alpaca_tok = tokenize_sft_dataset(alpaca_raw, b_tok, p_tok, cfg, t_args)
+        hermes_tok = tokenize_sft_dataset(hermes_raw, b_tok, p_tok, cfg, t_args)
+        
+        tokenized_dataset = concatenate_datasets([alpaca_tok, hermes_tok]).shuffle(seed=cfg.seed)
+        LOGGER.info(f"Dataset preparation complete. Total blended samples: {len(tokenized_dataset)}")
+        # ---------------------------------------------------------
+        
     except Exception as e:
         LOGGER.error("Failed during Tokenizer initialization or Dataset loading.", exc_info=True)
         raise
